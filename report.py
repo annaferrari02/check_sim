@@ -1,155 +1,306 @@
-"""Assemble a single Markdown report + PNG figures from the check results."""
+"""
+Batch-level report: assesses THIS launch configuration across all sims.
+
+One Markdown file, organised by check (not by patient). Each section gives a
+cohort verdict, a figure, and a compact per-sim (and, for Murray, per-vessel)
+table. render_cohort() works on whatever sims are present in all_results, so it
+can be called incrementally.
+"""
 
 import os
+import time
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import DYN_PER_MMHG
+import aggregate as agg
 
 
-def _fig_path(out_dir, patient, name):
-    return os.path.join(out_dir, "figs", f"{patient}_{name}.png")
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def _figpath(out_dir, name):
+    return os.path.join(out_dir, "figs", f"batch_{name}.png")
 
 
-def _save(fig, path, dpi):
+def _save(fig, path, dpi, retries=3, backoff=0.2):
+    # On Windows, savefig() into a freshly-touched folder can occasionally hit
+    # a transient OSError (e.g. errno 22) if AV/indexing briefly holds the
+    # file we just created a moment ago for a sibling figure. Retry a few
+    # times with a short backoff rather than losing the whole batch report.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.tight_layout()
-    fig.savefig(path, dpi=dpi)
+    for attempt in range(1, retries + 1):
+        try:
+            fig.savefig(path, dpi=dpi)
+            break
+        except OSError:
+            if attempt == retries:
+                plt.close(fig)
+                raise
+            time.sleep(backoff * attempt)
     plt.close(fig)
+
+
+def _rel(path, out_dir):
+    return os.path.relpath(path, out_dir)
+
+
+def _stat_line(s, unit=""):
+    return (f"median {s['median']:.2f}{unit}, mean {s['mean']:.2f}{unit}, "
+            f"sd {s['sd']:.2f}, range {s['min']:.2f}–{s['max']:.2f}{unit} "
+            f"(n={s['n']})")
+
+
+def _frac_within(vals, lo, hi):
+    v = np.asarray(vals, float)
+    return int(np.sum((v >= lo) & (v <= hi))), len(v)
+
+
+def _frac_below(vals, thr):
+    v = np.asarray(vals, float)
+    return int(np.sum(np.abs(v) <= thr)), len(v)
 
 
 # ----------------------------------------------------------------------------
 # figures
 # ----------------------------------------------------------------------------
-def _plot_shape(sc, title, ylabel, path, dpi):
-    fig, ax = plt.subplots(figsize=(5.2, 3.4))
-    ax.plot(sc["phase"], sc["last_demeaned"], label="last (demeaned)")
-    ax.plot(sc["phase"], sc["prev_demeaned"], "--", label="penultimate (demeaned)")
-    ax.set_xlabel("phase [s]")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend(fontsize=8)
+def _fig_convergence(scalars, cfg, path):
+    names = list(scalars)
+    shift = [scalars[p]["conv_shift_mmHg"] for p in names]
+    shape = [scalars[p]["conv_shape_pct"] for p in names]
+    fig, ax = plt.subplots(figsize=(5.6, 4.0))
+    ax.scatter(shift, shape)
+    for p, x, y in zip(names, shift, shape):
+        ax.annotate(p, (x, y), fontsize=6, xytext=(3, 3),
+                    textcoords="offset points")
+    ax.axhline(cfg.shape_rms_over_pp_ok * 100, ls="--", color="grey", lw=1)
+    ax.set_xlabel("inlet mean drift, last−penult [mmHg]")
+    ax.set_ylabel("inlet shape change RMS/PP [%]")
+    ax.set_title("Convergence per sim (near 0,0 = converged)")
     ax.grid(alpha=0.3)
-    _save(fig, path, dpi)
+    _save(fig, path, cfg.figure_dpi)
 
 
-def _plot_murray_bar(rows, path, dpi):
-    names = [r["face"] for r in rows]
+def _fig_sorted_bar(names, vals, ok_line, title, ylabel, path, cfg):
+    order = np.argsort(vals)
+    names = [names[i] for i in order]
+    vals = np.array(vals)[order]
     x = np.arange(len(names))
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.5 * len(names) + 2), 3.4))
-    ax.bar(x - 0.2, [r["murray_frac"] for r in rows], 0.4, label="Murray r^3")
-    ax.bar(x + 0.2, [r["sim_frac"] for r in rows], 0.4, label="simulated")
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.45 * len(names) + 2), 3.6))
+    ax.bar(x, vals)
+    if ok_line is not None:
+        ax.axhline(ok_line, ls="--", color="red", lw=1,
+                   label=f"reference {ok_line:g}")
+        ax.legend(fontsize=8)
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
-    ax.set_ylabel("flow fraction")
-    ax.set_title("Flow split: Murray vs simulated (last cycle)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3, axis="y")
+    _save(fig, path, cfg.figure_dpi)
+
+
+def _fig_murray_by_vessel(vessel_stats, path, cfg):
+    names = [v["face"] for v in vessel_stats]
+    mean = [v["mean_pct"] for v in vessel_stats]
+    sd = [v["sd_pct"] for v in vessel_stats]
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.5 * len(names) + 2), 3.8))
+    ax.bar(x, mean, yerr=sd, capsize=3)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("Murray rel. error [%]  (sim − Murray)")
+    ax.set_title("Flow-split deviation by vessel across batch (mean ± sd)")
+    ax.grid(alpha=0.3, axis="y")
+    _save(fig, path, cfg.figure_dpi)
+
+
+def _fig_pulse_pressure(scalars, cfg, path):
+    names = list(scalars)
+    pp = [scalars[p]["pp_mmHg"] for p in names]
+    order = np.argsort(pp)
+    names = [names[i] for i in order]
+    pp = np.array(pp)[order]
+    x = np.arange(len(names))
+    lo, hi = cfg.pulse_pressure_band_mmHg
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.45 * len(names) + 2), 3.6))
+    ax.axhspan(lo, hi, color="green", alpha=0.10, label=f"ref band {lo:g}–{hi:g}")
+    ax.bar(x, pp)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("inlet pulse pressure [mmHg]")
+    ax.set_title("Inlet pulse pressure per sim")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3, axis="y")
-    _save(fig, path, dpi)
+    _save(fig, path, cfg.figure_dpi)
 
 
 # ----------------------------------------------------------------------------
-# per-patient markdown
+# the report
 # ----------------------------------------------------------------------------
-def render_patient(patient, r, out_dir, cfg):
-    """r = dict of the four check results. Returns markdown string, writes figs."""
-    L = [f"## {patient}\n"]
+def render_cohort(all_results, cfg, out_dir):
+    L = []
+    ok = agg.ok_patients(all_results)
+    failed = agg.failed_patients(all_results)
+    n_ok = len(ok)
 
-    # --- check 1 -----------------------------------------------------------
-    c1 = r["check1"]
-    L.append("### 1. Mean pressure drop across 3D domain (last cycle)\n")
-    L.append(f"- inlet mean pressure: **{c1['p_inlet_mmHg']:.2f} mmHg** "
-             f"({c1['p_inlet_dyn']:.0f} dyn/cm^2)")
-    L.append(f"- flow-weighted outlet mean: **{c1['p_outlet_fw_mmHg']:.2f} mmHg**")
-    L.append(f"- inlet - outlet: **{c1['diff_mmHg']:.3f} mmHg** "
-             f"= {c1['diff_frac_MAP']*100:.2f}% of MAP, "
-             f"{c1['diff_frac_pinlet']*100:.2f}% of inlet mean")
-    L.append(f"- inlet pulse pressure: {c1['pulse_pressure_inlet_mmHg']:.2f} mmHg\n")
-    L.append("| outlet | mean p [mmHg] | mean Q [mL/s] |")
-    L.append("|---|---|---|")
-    for o in c1["outlets"]:
-        L.append(f"| {o['face']} | {o['p_mmHg']:.2f} | {o['q_mL_s']:.3f} |")
-    L.append("")
+    # ---- header / configuration ------------------------------------------
+    L += [
+        "# Batch report — launch configuration assessment\n",
+        f"Simulations analysed: **{n_ok}** "
+        f"({len(failed)} failed).  "
+        f"T = {cfg.T} s, dt = {cfg.dt} s, cycles = {cfg.n_cycles}, "
+        f"MAP = {cfg.MAP_dyn_cm2:.0f} dyn/cm² "
+        f"({cfg.MAP_dyn_cm2/DYN_PER_MMHG:.0f} mmHg).",
+        "",
+        "This report evaluates how the shared boundary-condition setup behaves "
+        "across the batch: convergence, whether the 3D-domain resistance is "
+        "negligible, how closely the realised flow split follows Murray (and on "
+        "which vessels it does not), and whether the resulting inlet pressure / "
+        "pulse pressure are physiologically plausible.\n",
+    ]
+    if n_ok == 0:
+        L.append("_No successful simulations yet._\n")
+        if failed:
+            L.append("Failed: " + ", ".join(f"{p} ({e})" for p, e in failed.items()))
+        return "\n".join(L)
 
-    # --- check 4 (compact table + fig) ------------------------------------
-    c4 = r["check4"]
-    fig4 = _fig_path(out_dir, patient, "murray")
-    _plot_murray_bar(c4["rows"], fig4, cfg.figure_dpi)
-    L.append("### 4. Flow split vs Murray's law (last cycle)\n")
-    L.append(f"- RMS relative error: **{c4['rms_rel_err']*100:.1f}%**, "
-             f"max abs relative error: **{c4['max_abs_rel_err']*100:.1f}%**")
-    L.append(f"- total outlet flow: {c4['total_outlet_flow_mL_s']:.2f} mL/s\n")
-    L.append(f"![murray]({os.path.relpath(fig4, out_dir)})\n")
-    L.append("| outlet | r [cm] | Murray frac | sim frac | rel err |")
-    L.append("|---|---|---|---|---|")
-    for o in c4["rows"]:
-        L.append(f"| {o['face']} | {o['radius_cm']:.3f} | {o['murray_frac']:.3f} "
-                 f"| {o['sim_frac']:.3f} | {o['rel_err']*100:+.1f}% |")
-    L.append("")
-
-    # --- check 2 (pressure shape) -----------------------------------------
-    c2 = r["check2"]
-    inl = c2["inlet"]
-    fig2 = _fig_path(out_dir, patient, "pressure_shape_inlet")
-    _plot_shape(inl, f"{patient} inlet pressure — last vs penultimate",
-                "p - <p> [dyn/cm^2]", fig2, cfg.figure_dpi)
-    L.append("### 2. Pressure waveform: shape vs vertical shift\n")
-    L.append(f"Inlet — shift **{inl['shift']/DYN_PER_MMHG:.3f} mmHg**, "
-             f"shape RMS/PP **{inl['rms_over_PP']*100:.1f}%**, "
-             f"corr **{inl['corr']:.4f}**\n")
-    L.append(f"![pshape]({os.path.relpath(fig2, out_dir)})\n")
-    L.append("| face | shift [mmHg] | shape RMS/PP | corr |")
-    L.append("|---|---|---|---|")
-    L.append(f"| inlet | {inl['shift']/DYN_PER_MMHG:.3f} | "
-             f"{inl['rms_over_PP']*100:.1f}% | {inl['corr']:.4f} |")
-    for name, sc in c2["outlets"].items():
-        L.append(f"| {name} | {sc['shift']/DYN_PER_MMHG:.3f} | "
-                 f"{sc['rms_over_PP']*100:.1f}% | {sc['corr']:.4f} |")
-    L.append("")
-
-    # --- check 3 (flow shape) ---------------------------------------------
-    c3 = r["check3"]
-    L.append("### 3. Outlet flow waveform: shape vs vertical shift\n")
-    L.append("| outlet | shift [mL/s] | shape RMS/PP | corr |")
-    L.append("|---|---|---|---|")
-    for name, sc in c3.items():
-        L.append(f"| {name} | {sc['shift']:.3f} | "
-                 f"{sc['rms_over_PP']*100:.1f}% | {sc['corr']:.4f} |")
-    # one representative figure: the outlet with the largest shape change
-    worst = max(c3.items(), key=lambda kv: (kv[1]["rms_over_PP"]
-                                            if np.isfinite(kv[1]["rms_over_PP"]) else -1))
-    fig3 = _fig_path(out_dir, patient, f"flow_shape_{worst[0]}")
-    _plot_shape(worst[1], f"{patient} {worst[0]} flow — last vs penultimate",
-                "Q - <Q> [mL/s]", fig3, cfg.figure_dpi)
-    L.append("")
-    L.append(f"Largest shape change: **{worst[0]}**\n")
-    L.append(f"![qshape]({os.path.relpath(fig3, out_dir)})\n")
-
+    scalars = agg.per_sim_scalars(all_results)
+    olo, ohi = agg.outlet_count_range(all_results)
+    L.append(f"Outlets per model: {olo}" + ("" if olo == ohi else f"–{ohi}") + ".\n")
+    if failed:
+        L.append("**Failed sims:** " +
+                 ", ".join(f"{p} ({e})" for p, e in failed.items()) + "\n")
     L.append("\n---\n")
-    return "\n".join(L)
 
-
-def render_summary(all_results, cfg):
-    """One-line-per-patient overview table across all checks."""
-    L = ["# CFD post-processing report\n",
-         f"T = {cfg.T} s, dt = {cfg.dt} s, cycles = {cfg.n_cycles}, "
-         f"MAP = {cfg.MAP_dyn_cm2:.0f} dyn/cm^2 "
-         f"({cfg.MAP_dyn_cm2/DYN_PER_MMHG:.1f} mmHg)\n",
-         "## Summary\n",
-         "| patient | Δp inlet-outlet [mmHg] | Δp / MAP | "
-         "inlet p-shift [mmHg] | inlet shape RMS/PP | Murray RMS err |",
-         "|---|---|---|---|---|---|"]
-    for patient, r in all_results.items():
-        if r.get("error"):
-            L.append(f"| {patient} | ERROR: {r['error']} | | | | |")
-            continue
-        c1, c2, c4 = r["check1"], r["check2"], r["check4"]
-        L.append(f"| {patient} | {c1['diff_mmHg']:.3f} | "
-                 f"{c1['diff_frac_MAP']*100:.2f}% | "
-                 f"{c2['inlet']['shift']/DYN_PER_MMHG:.3f} | "
-                 f"{c2['inlet']['rms_over_PP']*100:.1f}% | "
-                 f"{c4['rms_rel_err']*100:.1f}% |")
+    # ---- 1. convergence ---------------------------------------------------
+    _, shift = agg.column(scalars, "conv_shift_mmHg")
+    _, shape = agg.column(scalars, "conv_shape_pct")
+    n_conv, n_tot = _frac_below(shape, cfg.shape_rms_over_pp_ok * 100)
+    fig = _figpath(out_dir, "convergence")
+    _fig_convergence(scalars, cfg, fig)
+    L += [
+        "## 1. Convergence to periodicity (last vs penultimate cycle)\n",
+        f"Inlet pressure **shape** settled (RMS/PP < "
+        f"{cfg.shape_rms_over_pp_ok*100:g}%) in **{n_conv}/{n_tot}** sims. "
+        f"Shape change across batch: {_stat_line(agg.summarize(shape), '%')}. "
+        f"Mean drift last−penult: {_stat_line(agg.summarize(np.abs(shift)), ' mmHg')}.",
+        "",
+        "With 3 cycles the pressure mean is not expected to be fully periodic; "
+        "what matters is that the waveform *shape* has converged while only the "
+        "mean is still drifting.\n",
+        f"![conv]({_rel(fig, out_dir)})\n",
+        "| sim | mean drift [mmHg] | shape RMS/PP [%] | corr |",
+        "|---|---|---|---|",
+    ]
+    for p in scalars:
+        s = scalars[p]
+        L.append(f"| {p} | {s['conv_shift_mmHg']:+.2f} | "
+                 f"{s['conv_shape_pct']:.1f} | {s['conv_corr']:.4f} |")
     L.append("\n---\n")
+
+    # ---- 2. 3D domain resistance -----------------------------------------
+    names_r, dpf = agg.column(scalars, "dp_frac_MAP_pct")
+    n_res, _ = _frac_below(dpf, cfg.resistance_frac_MAP_ok * 100)
+    fig = _figpath(out_dir, "resistance")
+    _fig_sorted_bar(names_r, list(dpf), cfg.resistance_frac_MAP_ok * 100,
+                    "Inlet−outlet Δp as % of MAP, per sim",
+                    "|Δp| / MAP [%]", fig, cfg)
+    L += [
+        "## 2. 3D-domain resistance (inlet vs flow-weighted outlet pressure)\n",
+        f"|Δp|/MAP below {cfg.resistance_frac_MAP_ok*100:g}% in "
+        f"**{n_res}/{len(dpf)}** sims. Across batch: "
+        f"{_stat_line(agg.summarize(np.abs(dpf)), '%')}.",
+        "",
+        "Small Δp/MAP ⇒ the 3D domain adds little resistance and the imposed "
+        "outlet RCRs dominate — the assumption behind the setup.\n",
+        f"![res]({_rel(fig, out_dir)})\n",
+        "| sim | Δp [mmHg] | Δp/MAP [%] |",
+        "|---|---|---|",
+    ]
+    for p in scalars:
+        s = scalars[p]
+        L.append(f"| {p} | {s['dp_mmHg']:+.3f} | {s['dp_frac_MAP_pct']:+.2f} |")
+    L.append("\n---\n")
+
+    # ---- 3. Murray adherence (the headline for this config) --------------
+    names_m, mrms = agg.column(scalars, "murray_rms_pct")
+    n_mur, _ = _frac_below(mrms, cfg.murray_rms_ok * 100)
+    fig_a = _figpath(out_dir, "murray_per_sim")
+    _fig_sorted_bar(names_m, list(mrms), cfg.murray_rms_ok * 100,
+                    "Murray RMS relative error, per sim",
+                    "RMS rel. error [%]", fig_a, cfg)
+    vessel_stats = agg.murray_by_vessel(all_results)
+    fig_b = _figpath(out_dir, "murray_by_vessel")
+    _fig_murray_by_vessel(vessel_stats, fig_b, cfg)
+    worst = vessel_stats[0] if vessel_stats else None
+    L += [
+        "## 3. Flow split vs Murray's law\n",
+        f"Per-sim RMS relative error below {cfg.murray_rms_ok*100:g}% in "
+        f"**{n_mur}/{len(mrms)}** sims; across batch "
+        f"{_stat_line(agg.summarize(mrms), '%')}.",
+        "",
+    ]
+    if worst:
+        L.append(f"**Where it deviates:** the largest systematic departure is at "
+                 f"**{worst['face']}** "
+                 f"({worst['mean_pct']:+.1f}% ± {worst['sd_pct']:.1f} across "
+                 f"{worst['n']} sims). A consistent sign here means the config "
+                 f"systematically over/under-supplies that district relative to "
+                 f"the imposed r³ split.\n")
+    L += [
+        f"![murray_sim]({_rel(fig_a, out_dir)})\n",
+        f"![murray_vessel]({_rel(fig_b, out_dir)})\n",
+        "Per-vessel deviation across the batch (sorted by |mean|):\n",
+        "| vessel | n | mean r [cm] | Murray frac | sim frac | rel err mean±sd [%] |",
+        "|---|---|---|---|---|---|",
+    ]
+    for v in vessel_stats:
+        L.append(f"| {v['face']} | {v['n']} | {v['mean_radius_cm']:.3f} | "
+                 f"{v['mean_murray_frac']:.3f} | {v['mean_sim_frac']:.3f} | "
+                 f"{v['mean_pct']:+.1f} ± {v['sd_pct']:.1f} |")
+    L.append("")
+    L += ["Per-sim summary:\n",
+          "| sim | RMS rel err [%] | max abs rel err [%] |",
+          "|---|---|---|"]
+    for p in scalars:
+        s = scalars[p]
+        L.append(f"| {p} | {s['murray_rms_pct']:.1f} | {s['murray_max_pct']:.1f} |")
+    L.append("\n---\n")
+
+    # ---- 4. pulse pressure / compliance ----------------------------------
+    _, pp = agg.column(scalars, "pp_mmHg")
+    lo, hi = cfg.pulse_pressure_band_mmHg
+    n_pp, _ = _frac_within(pp, lo, hi)
+    _, pin = agg.column(scalars, "p_inlet_mmHg")
+    fig = _figpath(out_dir, "pulse_pressure")
+    _fig_pulse_pressure(scalars, cfg, fig)
+    L += [
+        "## 4. Inlet pressure & pulse pressure (compliance plausibility)\n",
+        f"Inlet pulse pressure within the {lo:g}–{hi:g} mmHg reference band in "
+        f"**{n_pp}/{len(pp)}** sims; across batch "
+        f"{_stat_line(agg.summarize(pp), ' mmHg')}. "
+        f"Inlet mean pressure: {_stat_line(agg.summarize(pin), ' mmHg')} "
+        f"(target MAP {cfg.MAP_dyn_cm2/DYN_PER_MMHG:.0f} mmHg).",
+        "",
+        "Pulse pressure is a model output governed by the prescribed compliance; "
+        "a value far outside the band suggests total compliance is mis-scaled "
+        "(too low → PP too high, too high → PP too low).\n",
+        f"![pp]({_rel(fig, out_dir)})\n",
+        "| sim | inlet mean [mmHg] | sys/dia [mmHg] | PP [mmHg] |",
+        "|---|---|---|---|",
+    ]
+    for p in scalars:
+        s = scalars[p]
+        L.append(f"| {p} | {s['p_inlet_mmHg']:.1f} | "
+                 f"{s['p_sys_mmHg']:.0f}/{s['p_dia_mmHg']:.0f} | "
+                 f"{s['pp_mmHg']:.1f} |")
+    L.append("\n---\n")
+
+    L.append("_Reference bands are indicative (Les 2010 brachial; "
+             "Surianarayanan 2020 compliance tuning), not hard thresholds._\n")
     return "\n".join(L)

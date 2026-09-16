@@ -37,26 +37,25 @@ def main(cfg=None):
         raise SystemExit(f"No patients matching '{cfg.patient_glob}' "
                          f"under {cfg.patients_root}")
 
+    out_md = os.path.join(out_dir, "report.md")
     all_results = {}
     body_sections = []
     for pdir in patients:
         name = os.path.basename(pdir.rstrip("/"))
         print(f"[{name}] ...", flush=True)
         try:
-            r = run_patient(pdir, cfg)
-            all_results[name] = r
-            body_sections.append(report.render_patient(name, r, out_dir, cfg))
+            all_results[name] = run_patient(pdir, cfg)
             print(f"[{name}] done")
-        except Exception as e:  # keep going on the other patients
+        except Exception as e:  # keep going on the other sims
             all_results[name] = {"error": str(e)}
             print(f"[{name}] FAILED: {e}")
             traceback.print_exc()
+        # rewrite the single batch report after each sim (crash-safe)
+        md = report.render_cohort(all_results, cfg, out_dir)
+        with open(out_md, "w", encoding="utf-8") as fh:
+            fh.write(md)
 
-    md = report.render_summary(all_results, cfg) + "\n".join(body_sections)
-    out_md = os.path.join(out_dir, "report.md")
-    with open(out_md, "w", encoding= "utf-8") as fh:
-        fh.write(md)
-    print(f"\nReport written to {out_md}")
+    print(f"\nBatch report written to {out_md}")
 
 
 if __name__ == "__main__":

@@ -85,13 +85,17 @@ def check1_inlet_outlet_pressure(times, P, Q, faces, cfg):
     diff = p_in - p_out_fw
 
     pl = P[inlet.name][m_last]
-    PP = float(pl.max() - pl.min())
+    p_sys = float(pl.max())   # systolic  = peak inlet pressure over last cycle
+    p_dia = float(pl.min())   # diastolic = trough inlet pressure over last cycle
+    PP = p_sys - p_dia
     return {
         "p_inlet_dyn": p_in, "p_inlet_mmHg": p_in / DYN_PER_MMHG,
         "p_outlet_fw_dyn": p_out_fw, "p_outlet_fw_mmHg": p_out_fw / DYN_PER_MMHG,
         "diff_dyn": diff, "diff_mmHg": diff / DYN_PER_MMHG,
         "diff_frac_MAP": diff / cfg.MAP_dyn_cm2,
         "diff_frac_pinlet": diff / p_in if p_in else np.nan,
+        "p_inlet_sys_mmHg": p_sys / DYN_PER_MMHG,
+        "p_inlet_dia_mmHg": p_dia / DYN_PER_MMHG,
         "pulse_pressure_inlet_dyn": PP,
         "pulse_pressure_inlet_mmHg": PP / DYN_PER_MMHG,
         "outlets": rows,
