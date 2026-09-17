@@ -64,25 +64,32 @@ def _shape_compare(times, series, cfg):
 # CHECK 1 -- mean pressure drop across the 3D domain (inlet vs outlets)
 # ----------------------------------------------------------------------------
 def check1_inlet_outlet_pressure(times, P, Q, faces, cfg):
-    m_last, *_ = cycle_masks(times, cfg)
+    m_last, m_prev, _, _ = cycle_masks(times, cfg)
     tl = times[m_last]
+    tp = times[m_prev]
     inlet = _inlet(faces)
     outs = _outlets(faces)
 
-    p_in = cycle_mean(tl, P[inlet.name][m_last], cfg.T)
+    def _flow_weighted_drop(mask, tt):
+        p_i = cycle_mean(tt, P[inlet.name][mask], cfg.T)
+        num = den = 0.0
+        rws = []
+        for f in outs:
+            p_o = cycle_mean(tt, P[f.name][mask], cfg.T)
+            q_o = abs(cycle_mean(tt, Q[f.name][mask], cfg.T))
+            num += q_o * p_o
+            den += q_o
+            rws.append({"face": f.name, "p_dyn": p_o,
+                        "p_mmHg": p_o / DYN_PER_MMHG, "q_mL_s": q_o})
+        p_o_fw = num / den
+        return p_i, p_o_fw, p_i - p_o_fw, rws
 
-    # flow-weighted mean outlet pressure (small low-flow outlets weighted less)
-    num = den = 0.0
-    rows = []
-    for f in outs:
-        p_o = cycle_mean(tl, P[f.name][m_last], cfg.T)
-        q_o = abs(cycle_mean(tl, Q[f.name][m_last], cfg.T))
-        num += q_o * p_o
-        den += q_o
-        rows.append({"face": f.name, "p_dyn": p_o,
-                     "p_mmHg": p_o / DYN_PER_MMHG, "q_mL_s": q_o})
-    p_out_fw = num / den
-    diff = p_in - p_out_fw
+    p_in, p_out_fw, diff, rows = _flow_weighted_drop(m_last, tl)
+    # same drop on the penultimate cycle: pressure LEVEL still drifts between
+    # cycles, but the inlet-outlet DIFFERENCE should be ~stable even out of
+    # regime (both ends drift together), so diff_prev ≈ diff validates using
+    # the last-cycle drop as the 3D-resistance impact.
+    p_in_prev, p_out_fw_prev, diff_prev, _ = _flow_weighted_drop(m_prev, tp)
 
     pl = P[inlet.name][m_last]
     p_sys = float(pl.max())   # systolic  = peak inlet pressure over last cycle
@@ -92,6 +99,8 @@ def check1_inlet_outlet_pressure(times, P, Q, faces, cfg):
         "p_inlet_dyn": p_in, "p_inlet_mmHg": p_in / DYN_PER_MMHG,
         "p_outlet_fw_dyn": p_out_fw, "p_outlet_fw_mmHg": p_out_fw / DYN_PER_MMHG,
         "diff_dyn": diff, "diff_mmHg": diff / DYN_PER_MMHG,
+        "diff_prev_mmHg": diff_prev / DYN_PER_MMHG,
+        "diff_cycle_stability_mmHg": (diff - diff_prev) / DYN_PER_MMHG,
         "diff_frac_MAP": diff / cfg.MAP_dyn_cm2,
         "diff_frac_pinlet": diff / p_in if p_in else np.nan,
         "p_inlet_sys_mmHg": p_sys / DYN_PER_MMHG,

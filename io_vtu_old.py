@@ -1,5 +1,5 @@
 """
-Reading SimVascular / svSolver output (Optimized & Parallelized).
+Reading SimVascular / svSolver output.
 
 Results here are VOLUME .vtu files that do NOT carry GlobalNodeID, so we map
 each mesh-surface cap node to its coincident volume node by COORDINATES using a
@@ -8,10 +8,10 @@ the match distance is ~0. The point ordering is identical across all
 result_*.vtu of the same mesh/procs run, so the tree and the resulting indices
 are built ONCE (from the first timestep) and reused for every step.
 
-Pressure per face : area-weighted mean over the cap triangles.
-Flow per face     : Q = sum_tri (v_bar . areaVector), areaVector magnitude =
-                    triangle area, direction = outward normal (SimVascular
-                    winding). Inlet flow is NEGATIVE, as in setup_bcs.py.
+Pressure per face  : area-weighted mean over the cap triangles.
+Flow per face      : Q = sum_tri (v_bar . areaVector), areaVector magnitude =
+                     triangle area, direction = outward normal (SimVascular
+                     winding). Inlet flow is NEGATIVE, as in setup_bcs.py.
 """
 
 import os
@@ -19,7 +19,6 @@ import re
 import glob
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 try:
@@ -33,24 +32,20 @@ except ImportError as e:  # pragma: no cover
     raise ImportError("scipy is required (pip install scipy).") from e
 
 
-# Match distance above this (in mesh units, cm) is suspicious / fatal
+# match distance above this (in mesh units, cm) is suspicious / fatal
 _MATCH_WARN = 1e-6
 _MATCH_FATAL = 1e-2
 _READ_RETRIES = 4
 _READ_RETRY_DELAY = 1.0
 
 
-def _read_result(path, point_arrays=()):
-    """Read only the requested point arrays, retrying unstable files."""
+def _read_result(path):
+    """Read a result file, retrying if the solver is still writing it."""
     last_error = None
     for attempt in range(_READ_RETRIES + 1):
         try:
             size_before = os.path.getsize(path)
-            reader = pv.get_reader(path)
-            reader.disable_all_point_arrays()
-            for array_name in point_arrays:
-                reader.enable_point_array(array_name)
-            result = reader.read()
+            result = pv.read(path)
             size_after = os.path.getsize(path)
             if size_before == size_after:
                 return result
@@ -144,51 +139,14 @@ def _build_result_map(first_path, faces, cfg):
     return max_d
 
 
-def _process_step_worker(args):
-    """Worker function executed in parallel for a single result .vtu file."""
-    k, path, face_data, pressure_array, velocity_array = args
-
-    res = _read_result(path, (pressure_array, velocity_array))
-    p = np.asarray(res.point_data[pressure_array])
-    v = np.asarray(res.point_data[velocity_array])
-
-    p_res = {}
-    q_res = {}
-
-    for name, f_info in face_data.items():
-        ridx = f_info["ridx"]
-        tris = f_info["tris"]
-
-        pf = p[ridx]
-        vf = v[ridx]
-
-        p_tri = pf[tris].mean(axis=1)
-        p_res[name] = float((p_tri * f_info["tri_area"]).sum() / f_info["area"])
-
-        v_tri = vf[tris].mean(axis=1)
-        q_res[name] = float((v_tri * f_info["area_vec"]).sum())
-
-    return k, p_res, q_res
-
-
-def extract_timeseries(patient_dir, faces, cfg, max_workers=None):
+def extract_timeseries(patient_dir, faces, cfg):
     """
-    Parallelized time series extraction from .vtu files.
-
-    Parameters
-    ----------
-    patient_dir : str
-    faces       : dict
-    cfg         : Config object
-    max_workers : int, optional
-        Number of parallel processes to spawn. Defaults to all available CPU cores.
-
     Returns
     -------
-    times   : (n_t,) float      physical time of each saved step
-    P       : dict name -> (n_t,)  area-weighted mean pressure [dyn/cm^2]
-    Q       : dict name -> (n_t,)  flux (v.A) [cm^3/s], signed (inlet < 0)
-    match_d : float             max cap->volume node distance (diagnostic)
+    times    : (n_t,) float   physical time of each saved step
+    P        : dict name -> (n_t,)  area-weighted mean pressure [dyn/cm^2]
+    Q        : dict name -> (n_t,)  flux (v.A) [cm^3/s], signed (inlet < 0)
+    match_d  : float          max cap->volume node distance (diagnostic)
     """
     steps = discover_steps(patient_dir, cfg)
     if not steps:
@@ -198,35 +156,23 @@ def extract_timeseries(patient_dir, faces, cfg, max_workers=None):
         )
     match_d = _build_result_map(steps[0][1], faces, cfg)
 
-    # Lightweight serializable dictionary containing only essential array metadata
-    face_data = {
-        name: {
-            "ridx": f.ridx,
-            "tris": f.tris,
-            "tri_area": f.tri_area,
-            "area": f.area,
-            "area_vec": f.area_vec,
-        }
-        for name, f in faces.items()
-    }
-
     times = np.array([s * cfg.dt for s, _ in steps])
     P = {name: np.zeros(len(steps)) for name in faces}
     Q = {name: np.zeros(len(steps)) for name in faces}
 
-    tasks = [
-        (k, path, face_data, cfg.pressure_array, cfg.velocity_array)
-        for k, (_step, path) in enumerate(steps)
-    ]
-
-    workers = max_workers or os.cpu_count()
-    print(f"--> Extracting time series across {len(steps)} steps using {workers} CPU workers...", flush=True)
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        for k, p_res, q_res in executor.map(_process_step_worker, tasks):
-            for name in faces:
-                P[name][k] = p_res[name]
-                Q[name][k] = q_res[name]
+    for k, (_step, path) in enumerate(steps):
+        if k == 0 or (k + 1) % 10 == 0 or k == len(steps) - 1:
+            print(f"      reading result {k + 1}/{len(steps)}: "
+                  f"{os.path.basename(path)}", flush=True)
+        res = _read_result(path)
+        p = np.asarray(res.point_data[cfg.pressure_array])
+        v = np.asarray(res.point_data[cfg.velocity_array])
+        for f in faces.values():
+            pf = p[f.ridx]
+            vf = v[f.ridx]
+            p_tri = pf[f.tris].mean(axis=1)                 # (n_tri,)
+            P[f.name][k] = (p_tri * f.tri_area).sum() / f.area
+            v_tri = vf[f.tris].mean(axis=1)                 # (n_tri,3)
+            Q[f.name][k] = float((v_tri * f.area_vec).sum())
 
     return times, P, Q, match_d
-
