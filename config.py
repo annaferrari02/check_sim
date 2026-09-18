@@ -25,7 +25,7 @@ class Config:
     # Each patient folder (pz***) is expected to contain:
     #   <mesh_surfaces_subdir>/*.vtp   face geometry + GlobalNodeID
     #   <results_subdir>/<results_glob>  per-timestep results (VTP or VTU)
-    patients_root: str = "D:/database_sim" #da sistemare 
+    patients_root: str = "E:/database_sim" #da sistemare sulla base di dove stanno i dati
     patient_glob: str = "pz*"
     mesh_surfaces_subdir: str = "mesh-complete/mesh-surfaces"
     results_subdir: str = "72-procs"

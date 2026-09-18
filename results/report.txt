@@ -1,0 +1,78 @@
+
+REPORT — DISTRIBUZIONE DI FLUSSO AGLI OUTLET  (CFD post-EVAR vs letteratura)
+
+generato        : 2026-09-18 09:21
+pazienti        : 10
+periodo ciclo   : 0.8 s   
+forma           : shape_norm=pulse, peak-aligned
+TOST margin     : ±0.05   (margine di equivalenza — da giustificare)
+
+
+LEGENDA
+
+  frazione      = |media di ciclo dell'outlet| / |media inlet|  (adimensionale)
+  chiusura massa= Σ|medie outlet| / |media inlet| ; ideale = 1.000
+  coverage      = % di pazienti dentro la banda di normalita' di Les (media ±1.96 SD)
+  TOST          = test di EQUIVALENZA entro ±margin (p<α ⇒ equivalente).
+                  'NON equivalente' non prova che sia diverso: leggere con Welch/d.
+  Welch d       = dimensione dell'effetto (|d|: 0.2 piccolo, 0.5 medio, 0.8 grande)
+  corr / RMSE   = somiglianza di FORMA vs Les (dopo allineamento e normalizzazione
+
+
+
+letteratura: 
+divisione di Les: 
+Artery Branch	| Flow Split
+𝑄𝐶⁢𝑇	| 0.33⁢(𝑄𝑆⁢𝐶−𝑄𝐼⁢𝑅)
+𝑄𝐿⁢𝑅, 𝑄𝑅⁢𝑅⁢,𝑄𝑆⁢𝑀⁢𝐴	| 0.223⁢(𝑄𝑆⁢𝐶−𝑄𝐼⁢𝑅)
+𝑄𝐿⁢𝐸⁢𝐼,𝑄𝑅⁢𝐸⁢𝐼 |	0.7⁢𝑄𝐼⁢𝑅
+𝑄𝐿⁢𝐼⁢𝐼,𝑄𝑅⁢𝐼⁢𝐼	| 0.3⁢𝑄𝐼⁢𝑅
+𝑄𝑆,𝑄𝐻 |	0.5⁢𝑄𝐶⁢𝑇
+
+da https://pmc.ncbi.nlm.nih.gov/articles/PMC12108684/
+
+1. CONTROLLO QUALITA' — chiusura di massa
+
+  media 0.9390  (min 0.3898, max 1.0000)
+  pazienti oltre il 2% di sbilanciamento: 1/10
+  -> se >0, controllare lettura facce/segni PRIMA di interpretare le frazioni.
+
+
+2. LIVELLO 1 (robusto) — frazioni vs Les et al. (n=36)
+  2a) ILIACHE (L+R)  vs  IR/SC = 0.343 ± 0.084
+      coorte        : 0.792 ± 0.099  (n=9)
+      banda Les 95% : [0.178, 0.508]  — coverage 0.0%
+      TOST (±0.05) : p=1.0000  -> NON equivalente
+      Welch         : diff=+0.449  IC95 [+0.370, +0.527]  p=0.0000  d=+5.15
+      lettura       : scostamento SISTEMATICO e ampio (coverage bassa, effetto grande): differenza reale, non rumore campionario -> vedi note_metodologiche.
+
+  2b) VISCERE+RENI   vs  1-IR/SC = 0.657
+      coorte        : 0.202 ± 0.110  (n=10)
+      coverage      : 0.0%   TOST p=1.0000 (NON equiv.)
+      nota          : complementare delle iliache per conservazione di massa;
+                      SD di riferimento presa uguale a quella di IR/SC (approssimazione).
+
+#confronto tesi 2020
+  Solo scarto: 1 solo paziente di riferimento -> nessun test statistico lecito.
+  ramo                coorte     tesi     scarto
+  celiac    0.099 ± 0.070    0.218  -0.119 (-54.6%)
+  sma       0.072 ± 0.059    0.147  -0.075 (-51.0%)
+  renal_R   0.034 ± 0.020    0.147  -0.113 (-76.6%)
+
+3. FORMA vs Les — correlazione e RMSE (sola forma d'onda)
+
+  Piano SEPARATO dalle frazioni: qui la media e' rimossa (pulse). Forma e
+  magnitudine possono concordare/discordare in modo indipendente.
+  inlet          : corr 0.816 ± 0.000, RMSE 0.186  [sanity check BC]
+  visceral_renal : corr 0.729 ± 0.022, RMSE 0.218
+  iliac_total    : corr 0.961 ± 0.003, RMSE 0.082
+
+
+5. DIAGNOSTICA — reverse diastolico renale (soglia 0.02)
+
+  renal_R: reverse medio 0.026; 3/9 pz sopra soglia
+  -> un reverse renale diffuso puo' essere artefatto RCR (res1_split uniforme):
+     l'R1 e' il 15% fisso di R_tot per ogni outlet, non tarato per ramo. Da verificare.
+
+
+

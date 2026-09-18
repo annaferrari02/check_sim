@@ -1,0 +1,29 @@
+##check convergenza pressione su 5 cicli (pz092) 
+
+cicli valutati : 5
+MAP target     : 90.00 mmHg   (periodo 0.8s, dt 0.0025s)
+
+A. REGIME (media outlet: ultimo vs penultimo ciclo)
+   ciclo 1: P_outlet =   27.246 mmHg
+   ciclo 2: P_outlet =   44.105 mmHg
+   ciclo 3: P_outlet =   56.445 mmHg
+   ciclo 4: P_outlet =   65.508 mmHg
+   ciclo 5: P_outlet =   72.166 mmHg
+   |ultimo - penultimo| = 6.658 mmHg (7.40% di MAP)
+   fit asintoto  : P_inf = 90.46 mmHg (tau 3.23 cicli); ~9.7 cicli extra per <1% (((bisognerebbe simulare 10 cicli)))
+   -> NON ancora a regime (soglia 1.0 mmHg)
+
+B. OUTLET vs MAP (a regime la media outlet deve tendere a MAP)
+
+   P_outlet(ultimo) = 72.166 mmHg   diff = -17.834 mmHg (-19.82%)
+   -> NON coincide (soglia ±2.0 mmHg)
+---> asintoto stimato (90.5) e' compatibile con MAP: servono piu' cicli, non un difetto di BC.
+
+
+C. Δp DOMINIO 3D (inlet - outlet, ultimo ciclo)
+
+   P_inlet(ultimo)  = 76.206 mmHg
+   P_outlet(ultimo) = 72.166 mmHg
+   Δp = +4.040 mmHg (+4.49% di MAP)   |Δp_last-Δp_penult| = 0.001 mmHg
+   -> resistenza 3D TRASCURABILE (soglia 5% di MAP)
+

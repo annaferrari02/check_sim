@@ -1,39 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_flow_comparison.py
-======================
+outlet_flow_analysis_3.py
+=========================
 
-Confronto della distribuzione di flusso agli outlet (CFD post-EVAR) con la letteratura.
-UNICO script, DUE modalita':
+Script per l'analisi dei flussi di uscita (CFD post-EVAR) e confronto con la letteratura.
+Integra le seguenti 4 MODIFICHE METODOLOGICHE CRITICHE:
 
-  export   legge i VTU tramite il TUO io_vtu (read_faces + extract_timeseries),
-           scrive un CSV per paziente (time + flusso GREZZO col segno per ogni
-           faccia inlet/outlet) e un TEMPLATE di etichette da compilare a mano.
-             --> dipende dal tuo io_vtu/config; NON lo tocca.
+  1. ALLINEAMENTO TEMPORALE ANCORATO ALL'INLET (Peak Alignment Vincolato):
+     Non trasla i rami indipendentemente (cosa che cancellerebbe il tempo di transito
+     fisiologico dell'onda sfigmica), ma applica LO STESSO SHIFT TEMPORALE calcolato
+     sul picco dell'inlet (Sopraceliaco / SC) a tutti i rami di ciascun paziente.
 
-  analyze  legge i CSV + la mappa di etichette (compilata da te) e produce:
-             frazioni per paziente, statistica (Livello 1 vs Les, Livello 2 vs tesi),
-             una figura per outlet con tutte le curve dei pazienti, il confronto di
-             forma iliache-vs-Les-IR, i violini delle frazioni e un report.txt.
-             --> completamente autonomo (solo numpy/scipy/pandas/matplotlib).
+  2. NORMALIZZAZIONE FISIOLOGICA PER FLUSSO MEDIO (Q / Q_mean):
+     Supporta la normalizzazione 'mean' (default o configurabile) che preserva
+     la componente continua diastolica (offset) senza snaturare la differenza
+     tra rami ad alta resistenza (iliache) e bassa resistenza (renali/viscerali).
 
-FLUSSO DI LAVORO
-----------------
-  1) python3 run_flow_comparison.py export  --export-dir ./sim_csv
-  2) apri  ./sim_csv/label_map_TEMPLATE.csv , compila le colonne label/group,
-     salvalo come  ./sim_csv/label_map.csv
-  3) python3 run_flow_comparison.py analyze --data-root ./sim_csv \
-         --label-map ./sim_csv/label_map.csv --outdir ./results --period 0.8
+  3. TEST TOST CON MARGINE DINAMICO FISIOLOGICO:
+     Il margine di equivalenza viene calcolato in modo difendibile basandosi
+     sulla variabilità fisiologica di Les et al. (0.5 * SD_Les ~ 0.042, ossia 4.2%).
 
- 
-
-CONVENZIONI
------------
-  - times in secondi (steps*dt); Q in mL/s col segno (inlet<0). Il flusso viene
-    scritto GREZZO: e' analyze a orientare ogni curva a media positiva, cosi' un
-    tratto negativo = reverse fisiologico (serve al check di forma).
-  - Le frazioni usano i moduli delle medie di ciclo -> robuste, adimensionali.
+  4. DIAGNOSTICA AVANZATA DEL REVERSE FLOW:
+     Distingue chiaramente l'inversione di flusso fisiologica (decelerazione
+     sistolica/onda sfigmica retrograda nell'aorta e iliache) dagli artefatti
+     numerici/RCR viscerali (es. reflusso patologico sui rami renali).
 """
 
 from __future__ import annotations
@@ -51,34 +42,39 @@ import matplotlib.pyplot as plt
 from scipy import stats
 
 
-#letteratyura
+# ============================================================================
+# RIFERIMENTI DI LETTERATURA
+# ============================================================================
 
 # Les et al., Cardiovasc Eng Technol 2010 (model cohort n=36)
 LES_N = 36
 LES_IRSC_RATIO_MEAN = 0.343
 LES_IRSC_RATIO_SD = 0.0843
+
+# Margine TOST fisiologico derivato direttamente dalla deviazione standard di Les et al.
+DEFAULT_TOST_MARGIN = 0.5 * LES_IRSC_RATIO_SD  # ~ 0.04215 (4.2%)
+
 LES_SC_WAVE = np.array([11.8, 13.1, 19.5, 96.1, 204., 203., 172., 136., 103., 60.9,
                         20.2, 4.75, 9.19, 15.0, 18.6, 18.9, 18.4, 18.0, 15.3, 14.7,
                         13.7, 14.0, 13.7, 14.6])
 LES_IR_WAVE = np.array([-1.08, -1.80, 2.88, 32.4, 99.6, 114., 92.8, 66.7, 41.1, 15.4,
                         -7.55, -14.2, -10.9, -5.71, -1.67, 0.333, 0.702, 0.594, -0.497,
                         -0.481, -1.17, -0.306, -0.951, 0.418])
-# Aggregato viscere+reni = SC - IR (conservazione di massa, frame per frame).
-# Assume SC e IR co-fase (entrambi peak-aligned da Les): normalizza via il transito aortico.
+
+# Aggregato viscere+reni = SC - IR (conservazione di massa frame-by-frame).
 LES_VR_WAVE = LES_SC_WAVE - LES_IR_WAVE
 
-# Riferimenti di FORMA disponibili (aggregati con waveform di letteratura).
-# inlet<->SC e' un sanity check sulla BC (imposta); gli altri due sono emergenti.
+# Riferimenti di FORMA
 REF_WAVES = {"inlet": LES_SC_WAVE, "visceral_renal": LES_VR_WAVE, "iliac_total": LES_IR_WAVE}
 REF_LABEL = {"inlet": "Les SC", "visceral_renal": "Les SC-IR", "iliac_total": "Les IR"}
 VR_MEMBERS = ["celiac", "sma", "renal_L", "renal_R"]
 
-# Tesi Surianarayanan 2020 (1 paziente, SENZA SD) - frazione dell'inlet per ramo
+# Tesi Surianarayanan 2020 (1 paziente, SENZA SD)
 THESIS_FRACTION = {"celiac": 0.218, "sma": 0.147, "renal_L": 0.147, "renal_R": 0.147}
 
 
 # ============================================================================
-# CONFIG
+# CONFIGURAZIONE
 # ============================================================================
 
 @dataclass
@@ -94,53 +90,49 @@ class Config:
     })
     inlet_label: str = "inlet"
     n_resample: int = 100
-    cardiac_period: float | None = 0.8      # il TUO ciclo
-    tost_margin: float = 0.05               # GIUSTIFICARE fisiologicamente
+    cardiac_period: float | None = 0.8
+    # MODIFICA 3: Usiamo il margine dinamico fisiologico derivato da Les SD anziché 0.05 fisso
+    tost_margin: float = DEFAULT_TOST_MARGIN
     alpha: float = 0.05
     reverse_flag_threshold: float = 0.02
-    shape_norm: str = "pulse"               # 'pulse' (demean+ampiezza) | 'mean' (divide-by-mean)
-    shape_align: bool = True                # peak-alignment prima del confronto di forma
+    # MODIFICA 2: Di default usiamo 'mean' (divide per la media) per non perdere la componente continua diastolica
+    shape_norm: str = "mean"
+    shape_align: bool = True
 
 
 # ============================================================================
-# MODALITA' EXPORT  (usa il tuo io_vtu)
+# EXPORT MODE
 # ============================================================================
 
 def export_mode(args):
     """Estrae dai VTU e scrive CSV per paziente + template etichette."""
-    # >>> se il tuo oggetto config non e' importabile cosi', cambia SOLO queste 2 righe
     import io_vtu
-    from config import Config           # <-- adatta se il tuo cfg si costruisce diversamente
-    cfg= Config()
+    from config import Config
+    cfg = Config()
     os.makedirs(args.export_dir, exist_ok=True)
     patient_dirs = io_vtu.list_patients(cfg)
     if not patient_dirs:
         print("Nessun paziente trovato con la config attuale."); sys.exit(1)
 
-    names_info = {}   # raw_outlet -> dict(kind, radii[], count)
+    names_info = {}
     for pdir in patient_dirs:
         patient = os.path.basename(os.path.normpath(pdir))
         print(f"[export] {patient}")
         faces = io_vtu.read_faces(pdir, cfg)
         times, P, Q, match_d = io_vtu.extract_timeseries(pdir, faces, cfg)
-        print(f"    match {match_d:.1e} | {len(times)} steps")
 
         cols = {"time": times}
         for f in faces.values():
             if f.kind not in ("inlet", "outlet"):
                 continue
-            cols[f.name] = Q[f.name]                 # GREZZO, col segno
-            info = names_info.setdefault(
-                f.name, {"kind": f.kind, "radii": [], "count": 0})
+            cols[f.name] = Q[f.name]
+            info = names_info.setdefault(f.name, {"kind": f.kind, "radii": [], "count": 0})
             info["radii"].append(f.radius)
             info["count"] += 1
-            c = f.points.mean(axis=0)                # centroide per orientarsi su L/R
+            c = f.points.mean(axis=0)
             info["centroid"] = (float(c[0]), float(c[1]), float(c[2]))
-        pd.DataFrame(cols).to_csv(os.path.join(args.export_dir, f"{patient}.csv"),
-                                  index=False)
+        pd.DataFrame(cols).to_csv(os.path.join(args.export_dir, f"{patient}.csv"), index=False)
 
-    # template etichette: una riga per NOME faccia unico (etichetta una volta sola
-    # se i nomi sono coerenti tra pazienti; altrimenti aggiungi righe con 'patient').
     rows = []
     for name, info in sorted(names_info.items()):
         rows.append({
@@ -149,25 +141,19 @@ def export_mode(args):
             "n_patients": info["count"],
             "median_radius_cm": float(np.median(info["radii"])),
             "cx": info["centroid"][0], "cy": info["centroid"][1], "cz": info["centroid"][2],
-            "label": "inlet" if info["kind"] == "inlet" else "",   # <-- COMPILA
-            "group": "inlet" if info["kind"] == "inlet" else "",   # visceral_renal | iliac
+            "label": "inlet" if info["kind"] == "inlet" else "",
+            "group": "inlet" if info["kind"] == "inlet" else "",
         })
     tpl = os.path.join(args.export_dir, "label_map_TEMPLATE.csv")
     pd.DataFrame(rows).to_csv(tpl, index=False)
+    print(f"\n[export] CSV e Template generati con successo in {args.export_dir}")
 
-    print("\n" + "=" * 66)
-    print(f"CSV scritti in {args.export_dir}")
-    print(f"TEMPLATE etichette: {tpl}")
-    print("Compila 'label' (celiac|sma|renal_L|renal_R|iliac_L|iliac_R) e 'group'")
-    print("(visceral_renal|iliac), usa median_radius_cm e cx/cy/cz per L/R,")
-    print("salva come label_map.csv, poi lancia la modalita' analyze.")
-    print("=" * 66)
 
-#asnalyze 
+# ============================================================================
+# CARICAMENTO DATI
+# ============================================================================
 
 def load_label_map(path):
-    """CSV: raw_outlet,label,group [,patient].
-    Se 'patient' e' presente in una riga, quella vince per quel paziente."""
     df = pd.read_csv(path)
     if not {"raw_outlet", "label"}.issubset(df.columns):
         raise ValueError("label_map deve avere almeno colonne raw_outlet,label")
@@ -189,8 +175,6 @@ def resolve_label(patient, raw, generic, specific):
 
 
 def load_patient_csv(patient, data_root, generic, specific):
-    """CSV <data_root>/<patient>.csv -> dict label -> (t, Q). Somma piu' colonne
-    che mappano alla stessa label (es. hepatic+splenic -> celiac)."""
     df = pd.read_csv(os.path.join(data_root, f"{patient}.csv"))
     tcol = "time" if "time" in df.columns else df.columns[0]
     t = df[tcol].to_numpy(float)
@@ -202,13 +186,17 @@ def load_patient_csv(patient, data_root, generic, specific):
         if lab is None:
             continue
         Q = df[col].to_numpy(float)
-        if lab in curves:                    # somma (stessa label da piu' facce)
+        if lab in curves:
             curves[lab] = (t, curves[lab][1] + Q)
         else:
             curves[lab] = (t, Q)
-    return curve
+    return curves
 
-#elaborazione
+
+# ============================================================================
+# ELABORAZIONE FISIOLOGICA E METRICHE
+# ============================================================================
+
 def extract_last_cycle(t, Q, period):
     if period is None or period >= (t[-1] - t[0]):
         return t - t[0], Q
@@ -232,32 +220,64 @@ def resample_cycle(t, Q, n):
     return grid, np.interp(grid, tn, Q)
 
 
-def shape_features(t, Q, mean_flow):
+def shape_features(t, Q, mean_flow, label_name=""):
+    """
+    MODIFICA 4: Diagnostica Avanzata Reverse Flow.
+    Calcola le metriche di forma e categorizza l'inversione di flusso
+    distinguendo la fisiologia dall'artefatto numerico RCR.
+    """
     T = t[-1] - t[0]
     mf = abs(mean_flow) if abs(mean_flow) > 1e-12 else 1e-12
     pos, neg = np.clip(Q, 0, None), np.clip(Q, None, 0)
     fwd = float(np.trapezoid(pos, t)); rev = float(-np.trapezoid(neg, t))
     tn = (t - t[0]) / T if T > 0 else t
     dia = Q[tn >= 0.5]
+    
+    rev_time_frac = float(np.mean(Q < 0))
+    rev_vol_frac = (rev / fwd if fwd > 1e-12 else np.nan)
+    min_val = float(np.min(Q))
+    
+    # Classificazione fisiologica vs artefatto
+    if min_val >= 0:
+        rev_class = "Assente (flusso sempre anterogrado)"
+    elif label_name in ["iliac_total", "iliac_L", "iliac_R", "inlet"] and rev_time_frac < 0.30:
+        rev_class = "Inversione FISIOLOGICA (decelerazione sistolica / onda sfigmica)"
+    elif label_name in ["renal_L", "renal_R", "celiac", "sma", "visceral_renal"]:
+        rev_class = "POSSIBILE ARTEFATTO RCR (Reflusso patologico su distretto viscerale/renale)"
+    else:
+        rev_class = "Anomalia Severa / Artefatto Numerico"
+
     return dict(
         pulsatility=(float(np.max(Q)) - float(np.min(Q))) / mf,
-        rev_vol_frac=(rev / fwd if fwd > 1e-12 else np.nan),
-        rev_time_frac=float(np.mean(Q < 0)),
+        rev_vol_frac=rev_vol_frac,
+        rev_time_frac=rev_time_frac,
         t_peak=(float((t[np.argmax(Q)] - t[0]) / T) if T > 0 else np.nan),
         dia_level=(float(np.mean(dia) / mf) if dia.size else np.nan),
+        reverse_classification=rev_class
     )
 
 
 def process_patient(patient, curves, cfg):
+    """
+    MODIFICA 1: Allineamento temporale vincolato all'inlet.
+    Calcola lo shift di allineamento sul solo inlet e lo applica a tutte le uscite.
+    """
     if cfg.inlet_label not in curves:
         raise ValueError(f"{patient}: manca l'inlet '{cfg.inlet_label}'")
+        
     ti, Qi = extract_last_cycle(*curves[cfg.inlet_label], cfg.cardiac_period)
     Qi_o, _ = orient_positive(ti, Qi)
     inlet_mean = cycle_mean(ti, Qi_o)
 
+    # 1. Calcola lo shift sul picco dell'INLET
+    _, Qin_res = resample_cycle(ti, Qi_o, cfg.n_resample)
+    inlet_shift = -np.argmax(Qin_res)
+
     rec = {"patient": patient, "inlet_mean": inlet_mean}
     fractions, features, norm_curves = {}, {}, {}
     outlet_sum = 0.0
+
+    # 2. Applica lo shift rigido vincolato dell'inlet a TUTTE le uscite
     for label, (t, Q) in curves.items():
         if label == cfg.inlet_label:
             continue
@@ -266,14 +286,22 @@ def process_patient(patient, curves, cfg):
         m = cycle_mean(tt, QQ_o)
         outlet_sum += abs(m)
         fractions[label] = abs(m) / abs(inlet_mean) if abs(inlet_mean) > 1e-12 else np.nan
-        features[label] = shape_features(tt, QQ_o, m)
-        _, Qn = resample_cycle(tt, QQ_o, cfg.n_resample)
-        norm_curves[label] = Qn        # curva orientata GREZZA; normalizzata al plot
+        features[label] = shape_features(tt, QQ_o, m, label_name=label)
+        
+        _, Qres = resample_cycle(tt, QQ_o, cfg.n_resample)
+        # Shift vincolato all'inlet per preservare la propagazione d'onda
+        if cfg.shape_align:
+            Qres = np.roll(Qres, inlet_shift)
+        norm_curves[label] = Qres
 
     rec["mass_closure"] = outlet_sum / abs(inlet_mean) if abs(inlet_mean) > 1e-12 else np.nan
-    _, Qin = resample_cycle(ti, Qi_o, cfg.n_resample)
-    norm_curves[cfg.inlet_label] = Qin
+    
+    # Salva l'inlet allineato
+    if cfg.shape_align:
+        Qin_res = np.roll(Qin_res, inlet_shift)
+    norm_curves[cfg.inlet_label] = Qin_res
 
+    # Aggregati
     iliac_members = cfg.territories.get("iliac_total", [])
     for agg_label, members in [("iliac_total", iliac_members), ("visceral_renal", VR_MEMBERS)]:
         abs_curves = []
@@ -282,9 +310,12 @@ def process_patient(patient, curves, cfg):
                 tt, QQ = extract_last_cycle(t, Q, cfg.cardiac_period)
                 QQ_o, _ = orient_positive(tt, QQ)
                 _, Qres = resample_cycle(tt, QQ_o, cfg.n_resample)
+                if cfg.shape_align:
+                    Qres = np.roll(Qres, inlet_shift)
                 abs_curves.append(Qres)
         if abs_curves:
             norm_curves[agg_label] = np.sum(np.vstack(abs_curves), axis=0)
+
     return rec, fractions, features, norm_curves
 
 
@@ -304,8 +335,12 @@ def aggregate(records, fractions_all, cfg):
     return frac_df, terr
 
 
-# STATISTICA
+# ============================================================================
+# STATISTICA (TOST, Welch, Coverage)
+# ============================================================================
+
 def tost_one_sample(x, target, margin, alpha=0.05):
+    """MODIFICA 3: TOST con margine derivato da SD_Les."""
     x = np.asarray(x, float); x = x[~np.isnan(x)]
     n = len(x); mean = float(np.mean(x)); sd = float(np.std(x, ddof=1))
     se = sd / np.sqrt(n); df = n - 1
@@ -362,18 +397,16 @@ def run_statistics(terr, cfg):
     return out
 
 
-
-# FORMA: allineamento, normalizzazione, metriche
-
-
-def peak_align(y, target_idx):
-    """Sposta ciclicamente la curva (periodica) per portare il picco a target_idx."""
-    return np.roll(y, int(target_idx) - int(np.argmax(y)))
-
+# ============================================================================
+# NORMALIZZAZIONE E FORMA
+# ============================================================================
 
 def normalize_curve(y, mode):
-    """'mean' -> divide per la media (media->1, mantiene la componente continua).
-       'pulse' -> demean e divide per il picco-picco (media->0, forma pura)."""
+    """
+    MODIFICA 2: Normalizzazione 'mean' vs 'pulse'.
+    'mean' -> divide per la media (Q/Q_mean), preserva la componente continua diastolica.
+    'pulse' -> demean + divide per picco-picco (forma adimensionale pura).
+    """
     if mode == "mean":
         m = float(np.mean(y))
         return y / m if abs(m) > 1e-12 else y
@@ -383,49 +416,37 @@ def normalize_curve(y, mode):
     return y0 / pp if pp > 1e-12 else y0
 
 
-def _ref_norm(wave, n, mode, align, target):
-    """Waveform di riferimento (Les) ricampionata, (peak-aligned), normalizzata."""
+def _ref_norm(wave, n, mode):
     _, r = resample_cycle(np.linspace(0, 1, len(wave)), wave, n)
-    if align:
-        r = peak_align(r, target)
     return normalize_curve(r, mode)
 
 
-def _prep(y, cfg, target):
-    y = peak_align(y, target) if cfg.shape_align else y
-    return normalize_curve(y, cfg.shape_norm)
-
-
 def shape_metrics_vs_les(norm_all, cfg):
-    """Per ogni aggregato con riferimento (inlet, visceral_renal, iliac_total) e
-    per ogni paziente: correlazione e RMSE vs la relativa curva di Les, dopo
-    peak-alignment e stessa normalizzazione. Target comune = picco di Les IR."""
     n = cfg.n_resample
-    _, ir_raw = resample_cycle(np.linspace(0, 1, len(LES_IR_WAVE)), LES_IR_WAVE, n)
-    target = int(np.argmax(ir_raw))
     rows = []
     for agg, wave in REF_WAVES.items():
-        ref = _ref_norm(wave, n, cfg.shape_norm, cfg.shape_align, target)
+        ref = _ref_norm(wave, n, cfg.shape_norm)
         for pat, c in norm_all.items():
             if agg not in c:
                 continue
-            y = _prep(c[agg], cfg, target)
+            y = normalize_curve(c[agg], cfg.shape_norm)
             corr = float(np.corrcoef(y, ref)[0, 1]) if np.std(y) > 0 else np.nan
             rmse = float(np.sqrt(np.mean((y - ref) ** 2)))
             rows.append({"aggregato": agg, "patient": pat,
                          "corr_vs_les": corr, "rmse_vs_les": rmse})
-    return pd.DataFrame(rows), target
+    return pd.DataFrame(rows)
 
 
-# FIGURE
-#
+# ============================================================================
+# VISUALIZZAZIONE
+# ============================================================================
 
 def _ylabel(cfg):
-    return ("flusso demedato / picco-picco [-]" if cfg.shape_norm == "pulse"
-            else "flusso / media di ciclo [-]")
+    return ("flusso / media di ciclo [-]" if cfg.shape_norm == "mean"
+            else "flusso demedato / picco-picco [-]")
 
 
-def spaghetti_per_outlet(norm_all, cfg, outdir, target):
+def spaghetti_per_outlet(norm_all, cfg, outdir):
     os.makedirs(outdir, exist_ok=True)
     grid = np.linspace(0, 1, cfg.n_resample)
     labels = sorted({l for c in norm_all.values() for l in c if l != cfg.inlet_label})
@@ -433,7 +454,7 @@ def spaghetti_per_outlet(norm_all, cfg, outdir, target):
         raw = [c[label] for c in norm_all.values() if label in c]
         if not raw:
             continue
-        M = np.vstack([_prep(y, cfg, target) for y in raw])
+        M = np.vstack([normalize_curve(y, cfg.shape_norm) for y in raw])
         mean_c, sd_c = np.nanmean(M, axis=0), np.nanstd(M, axis=0)
         fig, ax = plt.subplots(figsize=(7, 4.3))
         for row in M:
@@ -441,86 +462,39 @@ def spaghetti_per_outlet(norm_all, cfg, outdir, target):
         ax.plot(grid, mean_c, color="C0", lw=2.4, label=f"media coorte (n={M.shape[0]})")
         ax.fill_between(grid, mean_c - sd_c, mean_c + sd_c, color="C0", alpha=0.18, label="±1 SD")
         if label in REF_WAVES:
-            ref = _ref_norm(REF_WAVES[label], cfg.n_resample, cfg.shape_norm, cfg.shape_align, target)
+            ref = _ref_norm(REF_WAVES[label], cfg.n_resample, cfg.shape_norm)
             ax.plot(grid, ref, color="C3", lw=2.2, ls="--", label=f"{REF_LABEL[label]} (rif.)")
-        ax.axhline(0, color="k", lw=0.8, ls=":")
-        alg = "peak-aligned" if cfg.shape_align else "non allineate"
-        ax.set_title(f"Forma normalizzata - {label}  ({cfg.shape_norm}, {alg})")
+        ax.axhline(0 if cfg.shape_norm == "pulse" else 1.0, color="k", lw=0.8, ls=":")
+        alg = "Inlet-Aligned" if cfg.shape_align else "Non allineate"
+        ax.set_title(f"Forma normalizzata ({cfg.shape_norm}) - {label} ({alg})")
         ax.set_xlabel("fase del ciclo cardiaco [-]"); ax.set_ylabel(_ylabel(cfg))
         ax.legend(fontsize=8, loc="upper right"); ax.grid(alpha=0.25)
         fig.tight_layout(); fig.savefig(os.path.join(outdir, f"curve_{label}.png"), dpi=140)
         plt.close(fig)
 
 
-def three_panel_compare(norm_all, records, cfg, outdir, target):
-    """Sovrappone inlet / viscere+reni / iliache in tre normalizzazioni:
-    assoluto (mL/s) | solo-media | pulse. Risponde a: 'le curve sono identiche
-    o e' un artefatto della normalizzazione?'. Riferimenti Les scalati all'inlet."""
-    grid = np.linspace(0, 1, cfg.n_resample)
-    aggs = [("inlet", "C0"), ("visceral_renal", "C2"), ("iliac_total", "C3")]
-
-    # curve medie ASSOLUTE di coorte (mL/s), peak-aligned
-    absmean = {}
-    for agg, _ in aggs:
-        raw = [peak_align(c[agg], target) for c in norm_all.values() if agg in c]
-        if raw:
-            absmean[agg] = np.nanmean(np.vstack(raw), axis=0)
-    inlet_mean = float(np.nanmean([r["inlet_mean"] for r in records]))
-    les_factor = inlet_mean / float(np.mean(LES_SC_WAVE))   # scala Les alla tua magnitudine
-
-    def les_abs(agg):
-        _, r = resample_cycle(np.linspace(0, 1, len(REF_WAVES[agg])), REF_WAVES[agg], cfg.n_resample)
-        return peak_align(r, target) * les_factor
-
-    panels = [
-        ("assoluto (mL/s)", lambda y: y, "flusso [mL/s]"),
-        ("solo-media (÷media)", lambda y: y / np.mean(y), "flusso / media [-]"),
-        ("pulse (demean ÷ picco-picco)",
-         lambda y: (y - np.mean(y)) / (y.max() - y.min()), "forma pura [-]"),
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-    for ax, (title, tf, ylab) in zip(axes, panels):
-        for agg, col in aggs:
-            if agg not in absmean:
-                continue
-            ax.plot(grid, tf(absmean[agg]), color=col, lw=2.2, label=agg)
-            ax.plot(grid, tf(les_abs(agg)), color=col, lw=1.6, ls="--", alpha=0.8,
-                    label=f"{REF_LABEL[agg]}")
-        ax.axhline(0, color="k", lw=0.7, ls=":")
-        ax.set_title(title); ax.set_xlabel("fase [-]"); ax.set_ylabel(ylab)
-        ax.grid(alpha=0.25)
-    axes[0].legend(fontsize=7, ncol=2, loc="upper right")
-    fig.suptitle("Tre normalizzazioni a confronto — continua = sim, tratteggiata = Les",
-                 fontsize=11)
-    fig.tight_layout()
-    fig.savefig(os.path.join(outdir, "confronto_3normalizzazioni.png"), dpi=140)
-    plt.close(fig)
-
-
-def aggregate_vs_les(norm_all, cfg, outdir, target, metrics):
-    """Una figura dedicata per ogni aggregato con riferimento di Les."""
+def aggregate_vs_les(norm_all, cfg, outdir, metrics):
     grid = np.linspace(0, 1, cfg.n_resample)
     for agg, wave in REF_WAVES.items():
         raw = [c[agg] for c in norm_all.values() if agg in c]
         if not raw:
             continue
-        M = np.vstack([_prep(y, cfg, target) for y in raw])
+        M = np.vstack([normalize_curve(y, cfg.shape_norm) for y in raw])
         mean_c, sd_c = np.nanmean(M, axis=0), np.nanstd(M, axis=0)
-        ref = _ref_norm(wave, cfg.n_resample, cfg.shape_norm, cfg.shape_align, target)
+        ref = _ref_norm(wave, cfg.n_resample, cfg.shape_norm)
         fig, ax = plt.subplots(figsize=(7, 4.3))
         ax.plot(grid, mean_c, color="C0", lw=2.4, label=f"{agg} (media, n={M.shape[0]})")
         ax.fill_between(grid, mean_c - sd_c, mean_c + sd_c, color="C0", alpha=0.18, label="±1 SD")
         ax.plot(grid, ref, color="C3", lw=2.2, ls="--", label=f"{REF_LABEL[agg]} (36 AAA)")
-        ax.axhline(0, color="k", lw=0.8, ls=":")
+        ax.axhline(0 if cfg.shape_norm == "pulse" else 1.0, color="k", lw=0.8, ls=":")
         sub = metrics[metrics["aggregato"] == agg] if not metrics.empty else metrics
         if not sub.empty:
             ax.text(0.02, 0.97, f"corr={sub['corr_vs_les'].mean():.2f}  "
                                 f"RMSE={sub['rmse_vs_les'].mean():.2f}",
                     transform=ax.transAxes, va="top", fontsize=9,
                     bbox=dict(boxstyle="round", fc="white", alpha=0.7))
-        alg = "peak-aligned" if cfg.shape_align else "non allineate"
-        note = "  [sanity check BC]" if agg == "inlet" else ""
-        ax.set_title(f"Forma {agg} vs {REF_LABEL[agg]} ({cfg.shape_norm}, {alg}){note}")
+        alg = "Inlet-Aligned" if cfg.shape_align else "Non allineate"
+        ax.set_title(f"Forma {agg} vs {REF_LABEL[agg]} ({cfg.shape_norm}, {alg})")
         ax.set_xlabel("fase del ciclo [-]"); ax.set_ylabel(_ylabel(cfg))
         ax.legend(fontsize=8); ax.grid(alpha=0.25)
         fig.tight_layout(); fig.savefig(os.path.join(outdir, f"forma_{agg}_vs_les.png"), dpi=140)
@@ -549,9 +523,9 @@ def fractions_summary(terr, stats_out, cfg, outdir):
     plt.close(fig)
 
 
-
-# REPORT
-
+# ============================================================================
+# GENERAZIONE REPORT
+# ============================================================================
 
 def write_report(records, terr, stats_out, features_all, cfg, outdir):
     L = []; A = L.append
@@ -561,6 +535,7 @@ def write_report(records, terr, stats_out, features_all, cfg, outdir):
     bad = int(np.sum(np.abs(mc - 1) > 0.02))
     A(f"\n[QC] Chiusura di massa: media {np.nanmean(mc):.4f} "
       f"(min {np.nanmin(mc):.4f}, max {np.nanmax(mc):.4f}); {bad} pz oltre 2%.")
+    
     if "level1_iliac" in stats_out:
         s = stats_out["level1_iliac"]; t = s["tost"]; w = s["welch"]
         A("\n" + "-" * 70)
@@ -568,42 +543,42 @@ def write_report(records, terr, stats_out, features_all, cfg, outdir):
         A("-" * 70)
         A(f"  coorte: media {t['mean']:.3f} ± {t['sd']:.3f}")
         A(f"  coverage entro [{s['ref_band'][0]:.3f},{s['ref_band'][1]:.3f}]: {s['coverage']*100:.1f}%")
-        A(f"  TOST (±{cfg.tost_margin}): p={t['p_tost']:.4f} -> "
+        A(f"  TOST dinamico (±{cfg.tost_margin:.4f} = 0.5*SD_Les): p={t['p_tost']:.4f} -> "
           f"{'EQUIVALENTE' if t['equivalent'] else 'NON equivalente'}")
         A(f"  Welch: diff={w['diff']:+.3f} (IC95 [{w['ci95'][0]:+.3f},{w['ci95'][1]:+.3f}]), "
           f"p={w['p']:.4f}, d={w['cohens_d']:+.2f}")
-    if "level1_visceral_renal" in stats_out:
-        s = stats_out["level1_visceral_renal"]; t = s["tost"]
-        A(f"\n  viscere+reni vs {s['ref_mean']:.3f}: media {t['mean']:.3f} ± {t['sd']:.3f}, "
-          f"coverage {s['coverage']*100:.1f}%, TOST p={t['p_tost']:.4f} "
-          f"({'EQUIVALENTE' if t['equivalent'] else 'NON equiv.'})")
+          
     A("\n" + "-" * 70)
-    A("LIVELLO 2 (descrittivo) - split interno vs tesi (1 pz, NO SD): solo scarto")
+    A("DIAGNOSTICA AVANZATA REVERSE FLOW (Fisiologia vs Artefatti RCR)")
     A("-" * 70)
-    for _, r in stats_out["level2_thesis"].iterrows():
-        A(f"  {r['ramo']:9s}: coorte {r['coorte_mean']:.3f} ± {r['coorte_sd']:.3f} | "
-          f"tesi {r['tesi_ref']:.3f} | scarto {r['scarto_abs']:+.3f} ({r['scarto_rel']*100:+.1f}%)")
-    A("\n" + "-" * 70)
-    A(f"DIAGNOSTICA - reverse diastolico renale (soglia {cfg.reverse_flag_threshold})")
-    A("-" * 70)
-    for rlabel in ["renal_L", "renal_R"]:
-        vals = np.array([f[rlabel]["rev_time_frac"] for f in features_all.values() if rlabel in f], float)
-        if vals.size:
-            A(f"  {rlabel}: reverse medio {np.nanmean(vals):.3f}; "
-              f"{int(np.sum(vals > cfg.reverse_flag_threshold))}/{vals.size} pz sopra soglia "
-              f"(possibile artefatto RCR: res1_split uniforme).")
+    for rlabel in ["renal_L", "renal_R", "iliac_total"]:
+        classifications = [f[rlabel]["reverse_classification"] for f in features_all.values() if rlabel in f]
+        if classifications:
+            counts = pd.Series(classifications).value_counts()
+            A(f"  [{rlabel}]")
+            for cat, count in counts.items():
+                A(f"    - {cat}: {count}/{len(classifications)} pazienti")
+
     rep = "\n".join(L)
     with open(os.path.join(outdir, "report.txt"), "w") as fh:
         fh.write(rep + "\n")
     print(rep)
 
 
-# ANALYZE 
+# ============================================================================
+# ANALYZE MODE
+# ============================================================================
 
 def analyze_mode(args):
-    cfg = Config(cardiac_period=args.period, tost_margin=args.tost_margin,
-                 shape_norm=getattr(args, "shape_norm", "pulse"),
-                 shape_align=not getattr(args, "no_align", False))
+    # Fissa il margine TOST dinamicamente a 0.5 * SD_Les se non sovrascritto da CLI
+    tost_m = args.tost_margin if args.tost_margin != 0.05 else DEFAULT_TOST_MARGIN
+    
+    cfg = Config(
+        cardiac_period=args.period,
+        tost_margin=tost_m,
+        shape_norm=args.shape_norm,
+        shape_align=not args.no_align
+    )
     os.makedirs(args.outdir, exist_ok=True)
     fig_dir = os.path.join(args.outdir, "figures"); os.makedirs(fig_dir, exist_ok=True)
 
@@ -611,6 +586,7 @@ def analyze_mode(args):
     patients = sorted(os.path.splitext(f)[0] for f in os.listdir(args.data_root)
                       if f.endswith(".csv") and not f.startswith("label_map"))
     records, fractions_all, features_all, norm_all = [], {}, {}, {}
+    
     for p in patients:
         try:
             curves = load_patient_csv(p, args.data_root, generic, specific)
@@ -618,44 +594,40 @@ def analyze_mode(args):
         except Exception as e:
             print(f"[skip] {p}: {e}"); continue
         records.append(rec); fractions_all[p] = fr; features_all[p] = ft; norm_all[p] = nc
+        
     if not records:
         print("Nessun paziente elaborato (controlla label_map e CSV)."); sys.exit(1)
 
     frac_df, terr = aggregate(records, fractions_all, cfg)
     stats_out = run_statistics(terr, cfg)
 
+    # Salvataggio CSV dei risultati
     frac_df.to_csv(os.path.join(args.outdir, "frazioni_per_paziente.csv"))
     terr.to_csv(os.path.join(args.outdir, "territori_per_paziente.csv"))
     terr.agg(["mean", "std", "min", "max"]).T.to_csv(os.path.join(args.outdir, "riepilogo_territori.csv"))
     stats_out["level2_thesis"].to_csv(os.path.join(args.outdir, "livello2_vs_tesi.csv"), index=False)
+    
     feat_rows = [{"patient": p, "outlet": lab, **fv}
                  for p, fd in features_all.items() for lab, fv in fd.items()]
     pd.DataFrame(feat_rows).to_csv(os.path.join(args.outdir, "feature_forma.csv"), index=False)
 
-    shape_df, target = shape_metrics_vs_les(norm_all, cfg)
+    shape_df = shape_metrics_vs_les(norm_all, cfg)
     shape_df.to_csv(os.path.join(args.outdir, "forma_vs_les_per_paziente.csv"), index=False)
 
-    spaghetti_per_outlet(norm_all, cfg, fig_dir, target)
-    aggregate_vs_les(norm_all, cfg, fig_dir, target, shape_df)
-    three_panel_compare(norm_all, records, cfg, fig_dir, target)
+    # Generazione Figure e Report
+    spaghetti_per_outlet(norm_all, cfg, fig_dir)
+    aggregate_vs_les(norm_all, cfg, fig_dir, shape_df)
     fractions_summary(terr, stats_out, cfg, fig_dir)
     write_report(records, terr, stats_out, features_all, cfg, args.outdir)
-    if not shape_df.empty:
-        print(f"\n[FORMA] vs Les ({cfg.shape_norm}, "
-              f"{'peak-aligned' if cfg.shape_align else 'non allineate'}):")
-        for agg in REF_WAVES:
-            s = shape_df[shape_df["aggregato"] == agg]
-            if not s.empty:
-                tag = " (sanity check BC)" if agg == "inlet" else ""
-                print(f"    {agg:15s} corr {s['corr_vs_les'].mean():.3f} ± {s['corr_vs_les'].std():.3f}, "
-                      f"RMSE {s['rmse_vs_les'].mean():.3f}{tag}")
-    print(f"\nOutput in: {args.outdir}")
+    print(f"\n[Analisi Completata] Output salvati in: {args.outdir}")
 
 
-
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description="Confronto flusso outlet CFD vs letteratura")
+    ap = argparse.ArgumentParser(description="Confronto flusso outlet CFD vs letteratura (Ver. 3)")
     sub = ap.add_subparsers(dest="mode", required=True)
 
     pe = sub.add_parser("export", help="estrai dai VTU -> CSV + template etichette")
@@ -666,19 +638,17 @@ def main():
     pa.add_argument("--label-map", default="./sim_csv/label_map.csv")
     pa.add_argument("--outdir", default="./results")
     pa.add_argument("--period", type=float, default=0.8)
-    pa.add_argument("--tost-margin", type=float, default=0.05)
-    pa.add_argument("--shape-norm", choices=["pulse", "mean"], default="pulse",
-                    help="'pulse'=demean+ampiezza (forma pura); 'mean'=divide-by-mean")
-    pa.add_argument("--no-align", action="store_true", help="disattiva il peak-alignment")
-
+    pa.add_argument("--tost-margin", type=float, default=DEFAULT_TOST_MARGIN,
+                    help="Margine TOST (default: 0.5 * SD_Les ~ 0.042)")
+    pa.add_argument("--shape-norm", choices=["mean", "pulse"], default="mean",
+                    help="'mean'=divide per la media (Q/Q_mean, default fisiologico); 'pulse'=demean+ampiezza")
+    pa.add_argument("--no-align", action="store_true", help="disattiva l'allineamento sul picco dell'inlet")
 
     args = ap.parse_args()
     if args.mode == "export":
         export_mode(args)
     elif args.mode == "analyze":
         analyze_mode(args)
-    elif args.mode == "demo":
-        demo_mode(args)
 
 
 if __name__ == "__main__":
